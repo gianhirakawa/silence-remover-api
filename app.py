@@ -125,6 +125,152 @@ def process_silence_removal(job_id, video_url, noise_level, min_duration):
                     'completed_at': time.time()
                 })
 
+def process_burn_captions(job_id, video_url, words, words_per_line, caption_style, all_caps, style_preset, style):
+    """Background function to process caption burning"""
+    import json as json_lib
+    
+    with jobs_lock:
+        processing_jobs[job_id] = {
+            'status': 'processing',
+            'created_at': time.time(),
+            'video_url': video_url,
+            'progress': 'Downloading video...'
+        }
+    
+    try:
+        print(f"📝 [Job {job_id}] Processing burn-captions request")
+        
+        # Sanitize words
+        if isinstance(words, list):
+            for word_obj in words:
+                if isinstance(word_obj, dict) and 'word' in word_obj:
+                    word_obj['word'] = " ".join(word_obj['word'].split())
+        
+        # Update progress
+        with jobs_lock:
+            if job_id in processing_jobs:
+                processing_jobs[job_id]['progress'] = 'Creating SRT file...'
+        
+        temp_dir = "/tmp/videos"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        input_path = os.path.join(temp_dir, f"{job_id}_input.mp4")
+        srt_path = os.path.join(temp_dir, f"{job_id}_subs.srt")
+        output_path = os.path.join(temp_dir, f"{job_id}_output.mp4")
+        
+        # Download video
+        print(f"📥 Downloading video for job {job_id}...")
+        download_from_url(video_url, input_path)
+        
+        # Update progress
+        with jobs_lock:
+            if job_id in processing_jobs:
+                processing_jobs[job_id]['progress'] = 'Burning captions...'
+        
+        # Create SRT
+        print(f"📝 Creating SRT file... ({len(words)} words, {words_per_line} per line, all_caps={all_caps})")
+        if caption_style == 'word-by-word':
+            subtitle_count = create_word_by_word_srt(words, srt_path, all_caps=all_caps)
+        else:
+            subtitle_count = create_srt_from_words(words, srt_path, words_per_line, all_caps=all_caps)
+        
+        # Apply Thin Space Patch
+        try:
+            with open(srt_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            new_lines = []
+            for line in lines:
+                if '-->' in line or (line.strip().isdigit() and len(line.strip()) < 5):
+                    new_lines.append(line)
+                else:
+                    new_lines.append(line.replace(' ', '\u2009'))
+            
+            with open(srt_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            print("✨ Applied Thin Space Patch (U+2009) to SRT")
+        except Exception as e:
+            print(f"⚠️ Could not apply thin space patch: {e}")
+        
+        # Build style string
+        font_name = style.get('font_name', 'DejaVu Sans')
+        font_size = int(style.get('font_size', 24))
+        color = style.get('color', 'white')
+        outline = style.get('outline', True)
+        margin_h = int(style.get('margin_horizontal', 40))
+        margin_v = int(style.get('margin_vertical', style.get('margin_v', 70)))
+        spacing = float(style.get('spacing', -1.0))
+        shadow = int(style.get('shadow', 0))
+        
+        color_map = {
+            'white': '&H00FFFFFF', 'black': '&H00000000',
+            'yellow': '&H0000FFFF', 'red': '&H000000FF',
+            'green': '&H0000FF00', 'blue': '&H00FF0000'
+        }
+        primary_color = color_map.get(str(color).lower(), '&H00FFFFFF')
+        
+        style_string = f"FontName={font_name},FontSize={font_size},PrimaryColour={primary_color},MarginV={margin_v},MarginL={margin_h},MarginR={margin_h},Alignment=2,Spacing={spacing},Shadow={shadow}"
+        
+        if outline:
+            outline_width = style.get('outline_width', 2)
+            if isinstance(outline, (int, float)):
+                outline_width = outline
+            style_string += f",OutlineColour=&H00000000,BorderStyle=1,Outline={outline_width}"
+        else:
+            style_string += ",BorderStyle=1,Outline=0"
+        
+        # Burn subtitles
+        print(f"🔥 Burning captions using font: {font_name}")
+        vf_string = f"subtitles={srt_path}:fontsdir={FONTS_DIR}:force_style='{style_string}'"
+        
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', vf_string,
+            '-c:a', 'copy',
+            output_path, '-y'
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Clean up input and SRT files
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        if os.path.exists(srt_path):
+            os.remove(srt_path)
+        
+        if result.returncode == 0:
+            print("✅ Captions burned successfully!")
+            input_size = os.path.getsize(output_path) / (1024 * 1024) if os.path.exists(output_path) else 0
+            
+            with jobs_lock:
+                if job_id in processing_jobs:
+                    processing_jobs[job_id].update({
+                        'status': 'completed',
+                        'output_path': output_path,
+                        'output_size_mb': input_size,
+                        'completed_at': time.time()
+                    })
+        else:
+            print(f"❌ FFmpeg error: {result.stderr}")
+            with jobs_lock:
+                if job_id in processing_jobs:
+                    processing_jobs[job_id].update({
+                        'status': 'error',
+                        'error': f'Failed to burn captions: {result.stderr[:200]}',
+                        'completed_at': time.time()
+                    })
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"❌ [Job {job_id}] Error: {e}")
+        with jobs_lock:
+            if job_id in processing_jobs:
+                processing_jobs[job_id].update({
+                    'status': 'error',
+                    'error': str(e),
+                    'completed_at': time.time()
+                })
+
 def cleanup_old_jobs():
     """Remove jobs older than 1 hour"""
     current_time = time.time()
@@ -231,7 +377,8 @@ def remove_silence_async():
             'created_at': time.time(),
             'video_url': video_url,
             'noise_level': noise_level,
-            'min_duration': min_duration
+            'min_duration': min_duration,
+            'job_type': 'remove-silence'
         }
     
     # Start background processing
@@ -297,7 +444,7 @@ def remove_silence_status(job_id):
 
 @app.route('/remove-silence/download/<job_id>', methods=['GET'])
 def remove_silence_download(job_id):
-    """Download the processed video"""
+    """Download the processed video (streaming for large files)"""
     with jobs_lock:
         job = processing_jobs.get(job_id)
     
@@ -306,6 +453,12 @@ def remove_silence_download(job_id):
             'status': 'error',
             'message': 'Job not found'
         }), 404
+    
+    if job.get('job_type') != 'remove-silence':
+        return jsonify({
+            'status': 'error',
+            'message': 'Job ID does not match remove-silence job type'
+        }), 400
     
     if job['status'] != 'completed':
         return jsonify({
@@ -320,16 +473,27 @@ def remove_silence_download(job_id):
             'message': 'Output file not found. It may have been cleaned up.'
         }), 404
     
-    response = send_file(
-        output_path,
+    # Use streaming for large files to avoid timeout
+    def generate():
+        with open(output_path, 'rb') as f:
+            while True:
+                chunk = f.read(8192)  # 8KB chunks
+                if not chunk:
+                    break
+                yield chunk
+    
+    from flask import Response
+    response = Response(
+        generate(),
         mimetype='video/mp4',
-        as_attachment=True,
-        download_name='cleaned_video.mp4'
+        headers={
+            'Content-Disposition': 'attachment; filename=cleaned_video.mp4',
+            'Content-Length': str(os.path.getsize(output_path))
+        }
     )
     
     @response.call_on_close
     def cleanup():
-        # Don't delete immediately - give time for download to complete
         time.sleep(5)
         if os.path.exists(output_path):
             try:
@@ -375,9 +539,9 @@ def remove_silence_info():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/burn-captions', methods=['POST'])
-def burn_captions():
+def burn_captions_async():
     """
-    Burn captions into video from ElevenLabs word timestamps
+    Async burn captions - returns job ID immediately
     
     POST Body:
     {
@@ -397,11 +561,9 @@ def burn_captions():
         }
     }
     """
-    
     import json as json_lib
     
     data = request.json
-    
     video_url = data.get('video_url')
     words_input = data.get('words')
     
@@ -416,14 +578,6 @@ def burn_captions():
             words = words_input
         else:
             return jsonify({'error': 'words must be array or JSON string'}), 400
-            
-        # --- NEW: Sanitize Words (Fix double spaces) ---
-        # This fixes gaps like "THE  CALLS" -> "THE CALLS"
-        if isinstance(words, list):
-            for word_obj in words:
-                if isinstance(word_obj, dict) and 'word' in word_obj:
-                    # Remove double spaces and strip surrounding whitespace
-                    word_obj['word'] = " ".join(word_obj['word'].split())
         
         # Handle options
         words_per_line = int(data.get('words_per_line', 5))
@@ -448,124 +602,141 @@ def burn_captions():
             preset.update(style)
             style = preset
         
-        job_id = str(uuid.uuid4())[:8]
-        temp_dir = "/tmp/videos"
-        os.makedirs(temp_dir, exist_ok=True)
+        # Generate job ID
+        job_id = str(uuid.uuid4())
         
-        input_path = os.path.join(temp_dir, f"{job_id}_input.mp4")
-        srt_path = os.path.join(temp_dir, f"{job_id}_subs.srt")
-        output_path = os.path.join(temp_dir, f"{job_id}_output.mp4")
+        # Initialize job
+        with jobs_lock:
+            processing_jobs[job_id] = {
+                'status': 'pending',
+                'created_at': time.time(),
+                'video_url': video_url,
+                'job_type': 'burn-captions'
+            }
         
-        # Download video
-        print(f"📥 Downloading video for job {job_id}...")
-        download_from_url(video_url, input_path)
+        # Start background processing
+        thread = threading.Thread(
+            target=process_burn_captions,
+            args=(job_id, video_url, words, words_per_line, caption_style, all_caps, style_preset, style)
+        )
+        thread.daemon = True
+        thread.start()
         
-        # Create SRT
-        print(f"📝 Creating SRT file... ({len(words)} words, {words_per_line} per line, all_caps={all_caps})")
-        if caption_style == 'word-by-word':
-            subtitle_count = create_word_by_word_srt(words, srt_path, all_caps=all_caps)
-        else:
-            subtitle_count = create_srt_from_words(words, srt_path, words_per_line, all_caps=all_caps)
+        # Clean up old jobs periodically
+        cleanup_old_jobs()
         
-        # --- NEW: Apply "Thin Space" Patch ---
-        # Replace standard spaces with Unicode Thin Spaces (U+2009) in text lines
-        # This fixes wide gaps between words when using wide/bold fonts
-        try:
-            with open(srt_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            new_lines = []
-            for line in lines:
-                # Don't touch lines that look like timestamps or indices
-                if '-->' in line or (line.strip().isdigit() and len(line.strip()) < 5):
-                    new_lines.append(line)
-                else:
-                    # This is text content, replace space with Thin Space
-                    new_lines.append(line.replace(' ', '\u2009'))
-            
-            with open(srt_path, 'w', encoding='utf-8') as f:
-                f.writelines(new_lines)
-            print("✨ Applied Thin Space Patch (U+2009) to SRT")
-        except Exception as e:
-            print(f"⚠️ Could not apply thin space patch: {e}")
-
-        # Build style string
-        # Default to DejaVu Sans if no font is provided and no file exists
-        font_name = style.get('font_name', 'DejaVu Sans') 
-        font_size = int(style.get('font_size', 24))
-        color = style.get('color', 'white')
-        outline = style.get('outline', True)
-        
-        # Position & Spacing
-        margin_h = int(style.get('margin_horizontal', 40))
-        margin_v = int(style.get('margin_vertical', style.get('margin_v', 70))) # Prefer vertical, fallback to v
-        spacing = float(style.get('spacing', -1.0)) # Default to negative spacing for tight look
-        shadow = int(style.get('shadow', 0))
-        
-        color_map = {
-            'white': '&H00FFFFFF', 'black': '&H00000000',
-            'yellow': '&H0000FFFF', 'red': '&H000000FF',
-            'green': '&H0000FF00', 'blue': '&H00FF0000'
-        }
-        primary_color = color_map.get(str(color).lower(), '&H00FFFFFF')
-        
-        # Add MarginL, MarginR, MarginV, Alignment=2 (Centered), and Spacing
-        style_string = f"FontName={font_name},FontSize={font_size},PrimaryColour={primary_color},MarginV={margin_v},MarginL={margin_h},MarginR={margin_h},Alignment=2,Spacing={spacing},Shadow={shadow}"
-        
-        if outline:
-            # If explicit outline width is set in style, use it, otherwise default to 2
-            outline_width = style.get('outline_width', 2)
-            if isinstance(outline, bool) and outline:
-                pass # keep default width
-            elif isinstance(outline, (int, float)):
-                outline_width = outline
-                
-            style_string += f",OutlineColour=&H00000000,BorderStyle=1,Outline={outline_width}"
-        else:
-            style_string += ",BorderStyle=1,Outline=0"
-        
-        # Burn subtitles with fontsdir support
-        print(f"🔥 Burning captions using font: {font_name}")
-        print(f"✨ Style: Spacing={spacing}, MarginV={margin_v}")
-        print(f"📂 Local fonts dir: {FONTS_DIR}")
-        
-        # IMPORTANT: We add :fontsdir=... to the subtitles filter
-        # This allows FFmpeg to find fonts located in your project/fonts folder
-        vf_string = f"subtitles={srt_path}:fontsdir={FONTS_DIR}:force_style='{style_string}'"
-        
-        cmd = [
-            'ffmpeg', '-i', input_path,
-            '-vf', vf_string,
-            '-c:a', 'copy',
-            output_path, '-y'
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            print("✅ Captions burned successfully!")
-            response = send_file(
-                output_path,
-                mimetype='video/mp4',
-                as_attachment=True,
-                download_name='captioned_video.mp4'
-            )
-            @response.call_on_close
-            def cleanup():
-                time.sleep(2)
-                for path in [input_path, srt_path, output_path]:
-                    if os.path.exists(path): os.remove(path)
-                print(f"🧹 Cleaned up job {job_id}")
-            return response
-        else:
-            print(f"❌ FFmpeg error: {result.stderr}")
-            return jsonify({'status': 'error', 'message': 'Failed to burn captions', 'error': result.stderr}), 500
+        return jsonify({
+            'status': 'pending',
+            'job_id': job_id,
+            'message': 'Processing started. Use /burn-captions/status/{job_id} to check status.'
+        }), 202
     
     except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        print(f"❌ Error: {e}")
-        return jsonify({'status': 'error', 'message': str(e), 'trace': error_trace}), 500
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/burn-captions/status/<job_id>', methods=['GET'])
+def burn_captions_status(job_id):
+    """Check status of a burn-captions job"""
+    cleanup_old_jobs()
+    
+    with jobs_lock:
+        job = processing_jobs.get(job_id)
+    
+    if not job:
+        return jsonify({
+            'status': 'error',
+            'message': 'Job not found. Job may have expired or never existed.'
+        }), 404
+    
+    if job.get('job_type') != 'burn-captions':
+        return jsonify({
+            'status': 'error',
+            'message': 'Job ID does not match burn-captions job type'
+        }), 400
+    
+    # Return job status
+    response = {
+        'job_id': job_id,
+        'status': job['status'],
+        'created_at': job.get('created_at'),
+        'progress': job.get('progress', 'Unknown')
+    }
+    
+    if job['status'] == 'completed':
+        response.update({
+            'output_size_mb': job.get('output_size_mb', 0),
+            'completed_at': job.get('completed_at'),
+            'download_url': f'/burn-captions/download/{job_id}'
+        })
+    elif job['status'] == 'error':
+        response.update({
+            'error': job.get('error', 'Unknown error'),
+            'completed_at': job.get('completed_at')
+        })
+    
+    return jsonify(response), 200
+
+@app.route('/burn-captions/download/<job_id>', methods=['GET'])
+def burn_captions_download(job_id):
+    """Download the processed video with captions"""
+    with jobs_lock:
+        job = processing_jobs.get(job_id)
+    
+    if not job:
+        return jsonify({
+            'status': 'error',
+            'message': 'Job not found'
+        }), 404
+    
+    if job.get('job_type') != 'burn-captions':
+        return jsonify({
+            'status': 'error',
+            'message': 'Job ID does not match burn-captions job type'
+        }), 400
+    
+    if job['status'] != 'completed':
+        return jsonify({
+            'status': 'error',
+            'message': f'Job is not completed. Current status: {job["status"]}'
+        }), 400
+    
+    output_path = job.get('output_path')
+    if not output_path or not os.path.exists(output_path):
+        return jsonify({
+            'status': 'error',
+            'message': 'Output file not found. It may have been cleaned up.'
+        }), 404
+    
+    # Use streaming for large files
+    def generate():
+        with open(output_path, 'rb') as f:
+            while True:
+                chunk = f.read(8192)  # 8KB chunks
+                if not chunk:
+                    break
+                yield chunk
+    
+    from flask import Response
+    response = Response(
+        generate(),
+        mimetype='video/mp4',
+        headers={
+            'Content-Disposition': f'attachment; filename=captioned_video.mp4',
+            'Content-Length': str(os.path.getsize(output_path))
+        }
+    )
+    
+    @response.call_on_close
+    def cleanup():
+        time.sleep(5)
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+                print(f"🧹 Cleaned up downloaded file for job {job_id}")
+            except:
+                pass
+    
+    return response
 
 @app.route('/create-srt', methods=['POST'])
 def create_srt_only():
@@ -619,7 +790,9 @@ def test():
             'remove_silence_status': '/remove-silence/status/<job_id> (GET)',
             'remove_silence_download': '/remove-silence/download/<job_id> (GET)',
             'get_info': '/remove-silence/info (POST)',
-            'burn_captions': '/burn-captions (POST)',  
+            'burn_captions_async': '/burn-captions (POST) - Returns job ID',
+            'burn_captions_status': '/burn-captions/status/<job_id> (GET)',
+            'burn_captions_download': '/burn-captions/download/<job_id> (GET)',
             'create_srt': '/create-srt (POST)' 
         }
     })
