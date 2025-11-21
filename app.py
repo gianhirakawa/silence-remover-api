@@ -4,6 +4,7 @@ import time
 import uuid
 import subprocess
 import threading
+import requests
 from remove_silence import remove_silence_from_url, download_from_url
 from create_srt import create_srt_from_words, create_word_by_word_srt
 
@@ -64,6 +65,27 @@ STYLE_PRESETS = {
 processing_jobs = {}
 # Lock for thread-safe access to processing_jobs
 jobs_lock = threading.Lock()
+
+def validate_video_url(video_url):
+    """Validate that video_url is not pointing to our own API endpoints"""
+    if not video_url:
+        return False, "video_url is required"
+    
+    # Check if URL points to our own API endpoints
+    api_endpoints = [
+        '/remove-silence/download/',
+        '/burn-captions/download/',
+        '/remove-silence/status/',
+        '/burn-captions/status/',
+        '/remove-silence',
+        '/burn-captions'
+    ]
+    
+    for endpoint in api_endpoints:
+        if endpoint in video_url:
+            return False, f"video_url cannot point to API endpoints. Please provide a direct video URL, not '{endpoint}'. If you need to use a processed video, download it first and upload it to a storage service."
+    
+    return True, None
 
 def process_silence_removal(job_id, video_url, noise_level, min_duration):
     """Background function to process video removal"""
@@ -176,7 +198,17 @@ def process_burn_captions(job_id, video_url, words, words_per_line, caption_styl
         
         # Download video
         print(f"📥 Downloading video for job {job_id}...")
-        download_from_url(video_url, input_path)
+        try:
+            download_from_url(video_url, input_path)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                error_msg = f"Video URL returned 404. The URL may be expired or invalid. If you're trying to use a processed video from this API, please download it first and upload it to a storage service (e.g., Google Cloud Storage, S3, or a temporary file hosting service)."
+            else:
+                error_msg = f"Failed to download video: {str(e)}"
+            raise Exception(error_msg)
+        except Exception as e:
+            error_msg = f"Failed to download video from URL: {str(e)}. Please ensure the URL points to a direct video file, not an API endpoint."
+            raise Exception(error_msg)
         
         # Update progress
         with jobs_lock:
@@ -380,6 +412,11 @@ def remove_silence_async():
     if not video_url:
         return jsonify({'error': 'video_url required'}), 400
     
+    # Validate video URL
+    is_valid, error_msg = validate_video_url(video_url)
+    if not is_valid:
+        return jsonify({'error': error_msg}), 400
+    
     noise_level = data.get('noise_level', '-30dB')
     min_duration = float(data.get('min_duration', 0.5))
     
@@ -471,9 +508,10 @@ def remove_silence_download(job_id):
         }), 404
     
     if job.get('job_type') != 'remove-silence':
+        actual_type = job.get('job_type', 'unknown')
         return jsonify({
             'status': 'error',
-            'message': 'Job ID does not match remove-silence job type'
+            'message': f'Job ID does not match remove-silence job type. This job is of type: {actual_type}. Use /{actual_type}/download/{job_id} instead.'
         }), 400
     
     if job['status'] != 'completed':
@@ -585,6 +623,11 @@ def burn_captions_async():
     
     if not video_url or not words_input:
         return jsonify({'error': 'video_url and words required'}), 400
+    
+    # Validate video URL
+    is_valid, error_msg = validate_video_url(video_url)
+    if not is_valid:
+        return jsonify({'error': error_msg}), 400
     
     try:
         # Handle words
@@ -705,9 +748,10 @@ def burn_captions_download(job_id):
         }), 404
     
     if job.get('job_type') != 'burn-captions':
+        actual_type = job.get('job_type', 'unknown')
         return jsonify({
             'status': 'error',
-            'message': 'Job ID does not match burn-captions job type'
+            'message': f'Job ID does not match burn-captions job type. This job is of type: {actual_type}. Use /{actual_type}/download/{job_id} instead.'
         }), 400
     
     if job['status'] != 'completed':
