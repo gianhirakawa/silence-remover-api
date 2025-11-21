@@ -68,12 +68,20 @@ jobs_lock = threading.Lock()
 def process_silence_removal(job_id, video_url, noise_level, min_duration):
     """Background function to process video removal"""
     with jobs_lock:
-        processing_jobs[job_id] = {
-            'status': 'processing',
-            'created_at': time.time(),
-            'video_url': video_url,
-            'progress': 'Downloading video...'
-        }
+        # Update existing job instead of overwriting
+        if job_id in processing_jobs:
+            processing_jobs[job_id].update({
+                'status': 'processing',
+                'progress': 'Downloading video...'
+            })
+        else:
+            processing_jobs[job_id] = {
+                'status': 'processing',
+                'created_at': time.time(),
+                'video_url': video_url,
+                'progress': 'Downloading video...',
+                'job_type': 'remove-silence'
+            }
     
     try:
         print(f"📝 [Job {job_id}] Processing request for: {video_url}")
@@ -130,12 +138,20 @@ def process_burn_captions(job_id, video_url, words, words_per_line, caption_styl
     import json as json_lib
     
     with jobs_lock:
-        processing_jobs[job_id] = {
-            'status': 'processing',
-            'created_at': time.time(),
-            'video_url': video_url,
-            'progress': 'Downloading video...'
-        }
+        # Update existing job instead of overwriting
+        if job_id in processing_jobs:
+            processing_jobs[job_id].update({
+                'status': 'processing',
+                'progress': 'Downloading video...'
+            })
+        else:
+            processing_jobs[job_id] = {
+                'status': 'processing',
+                'created_at': time.time(),
+                'video_url': video_url,
+                'progress': 'Downloading video...',
+                'job_type': 'burn-captions'
+            }
     
     try:
         print(f"📝 [Job {job_id}] Processing burn-captions request")
