@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: silence-remover-api
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - PYTHONUNBUFFERED=1
+    
+    # We removed "volumes:" here. 
+    # Files now stay locked inside the container.
+
+    restart: unless-stopped
+    
+    # The Janitor Command:
+    # 1. Creates the folder
+    # 2. Starts the background loop to delete files > 60 mins old
+    # 3. Starts the Python app
+    command: >
+      sh -c "mkdir -p /tmp/videos && 
+             (while true; do find /tmp/videos -type f -mmin +60 -delete; sleep 600; done) & 
+             python app.py"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
