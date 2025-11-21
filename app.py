@@ -3,6 +3,7 @@ import os
 import time
 import uuid
 import subprocess
+import threading
 from remove_silence import remove_silence_from_url, download_from_url
 from create_srt import create_srt_from_words, create_word_by_word_srt
 
@@ -61,6 +62,91 @@ STYLE_PRESETS = {
 
 # Store processing results temporarily
 processing_jobs = {}
+# Lock for thread-safe access to processing_jobs
+jobs_lock = threading.Lock()
+
+def process_silence_removal(job_id, video_url, noise_level, min_duration):
+    """Background function to process video removal"""
+    with jobs_lock:
+        processing_jobs[job_id] = {
+            'status': 'processing',
+            'created_at': time.time(),
+            'video_url': video_url,
+            'progress': 'Downloading video...'
+        }
+    
+    try:
+        print(f"📝 [Job {job_id}] Processing request for: {video_url}")
+        
+        # Update progress
+        with jobs_lock:
+            if job_id in processing_jobs:
+                processing_jobs[job_id]['progress'] = 'Processing video...'
+        
+        # Process video
+        result = remove_silence_from_url(
+            video_url,
+            noise_level=noise_level,
+            min_duration=min_duration
+        )
+        
+        # Update job status
+        with jobs_lock:
+            if job_id in processing_jobs:
+                if result['status'] == 'success':
+                    processing_jobs[job_id].update({
+                        'status': 'completed',
+                        'output_path': result['output_path'],
+                        'silence_removed': result.get('silence_removed', 0),
+                        'time_saved_seconds': result.get('time_saved_seconds', 0),
+                        'input_size_mb': result.get('input_size_mb', 0),
+                        'output_size_mb': result.get('output_size_mb', 0),
+                        'completed_at': time.time()
+                    })
+                elif result['status'] == 'no_silence':
+                    processing_jobs[job_id].update({
+                        'status': 'no_silence',
+                        'message': result.get('message', 'No silence found'),
+                        'completed_at': time.time()
+                    })
+                else:
+                    processing_jobs[job_id].update({
+                        'status': 'error',
+                        'error': result.get('message', 'Unknown error'),
+                        'completed_at': time.time()
+                    })
+    except Exception as e:
+        print(f"❌ [Job {job_id}] Error: {e}")
+        with jobs_lock:
+            if job_id in processing_jobs:
+                processing_jobs[job_id].update({
+                    'status': 'error',
+                    'error': str(e),
+                    'completed_at': time.time()
+                })
+
+def cleanup_old_jobs():
+    """Remove jobs older than 1 hour"""
+    current_time = time.time()
+    with jobs_lock:
+        to_remove = []
+        for job_id, job in processing_jobs.items():
+            # Clean up completed/error jobs older than 1 hour
+            if job.get('status') in ['completed', 'error', 'no_silence']:
+                completed_at = job.get('completed_at', job.get('created_at', 0))
+                if current_time - completed_at > 3600:  # 1 hour
+                    # Also delete the output file if it exists
+                    output_path = job.get('output_path')
+                    if output_path and os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                            print(f"🧹 Cleaned up old job {job_id} and file")
+                        except:
+                            pass
+                    to_remove.append(job_id)
+        
+        for job_id in to_remove:
+            del processing_jobs[job_id]
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -125,8 +211,8 @@ def list_fonts():
         }), 500
 
 @app.route('/remove-silence', methods=['POST'])
-def remove_silence_sync():
-    """Synchronous silence removal"""
+def remove_silence_async():
+    """Async silence removal - returns job ID immediately"""
     data = request.json
     video_url = data.get('video_url')
     if not video_url:
@@ -135,35 +221,124 @@ def remove_silence_sync():
     noise_level = data.get('noise_level', '-30dB')
     min_duration = float(data.get('min_duration', 0.5))
     
-    print(f"📝 Processing request for: {video_url}")
+    # Generate job ID
+    job_id = str(uuid.uuid4())
     
-    try:
-        result = remove_silence_from_url(
-            video_url,
-            noise_level=noise_level,
-            min_duration=min_duration
-        )
-        
-        if result['status'] == 'success':
-            output_path = result['output_path']
-            response = send_file(
-                output_path,
-                mimetype='video/mp4',
-                as_attachment=True,
-                download_name='cleaned_video.mp4'
-            )
-            @response.call_on_close
-            def cleanup():
-                time.sleep(2)
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-            return response
-        elif result['status'] == 'no_silence':
-            return jsonify({'status': 'no_silence', 'message': result['message']}), 200
-        else:
-            return jsonify(result), 500
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+    # Initialize job
+    with jobs_lock:
+        processing_jobs[job_id] = {
+            'status': 'pending',
+            'created_at': time.time(),
+            'video_url': video_url,
+            'noise_level': noise_level,
+            'min_duration': min_duration
+        }
+    
+    # Start background processing
+    thread = threading.Thread(
+        target=process_silence_removal,
+        args=(job_id, video_url, noise_level, min_duration)
+    )
+    thread.daemon = True
+    thread.start()
+    
+    # Clean up old jobs periodically
+    cleanup_old_jobs()
+    
+    return jsonify({
+        'status': 'pending',
+        'job_id': job_id,
+        'message': 'Processing started. Use /remove-silence/status/{job_id} to check status.'
+    }), 202
+
+@app.route('/remove-silence/status/<job_id>', methods=['GET'])
+def remove_silence_status(job_id):
+    """Check status of a silence removal job"""
+    cleanup_old_jobs()
+    
+    with jobs_lock:
+        job = processing_jobs.get(job_id)
+    
+    if not job:
+        return jsonify({
+            'status': 'error',
+            'message': 'Job not found. Job may have expired or never existed.'
+        }), 404
+    
+    # Return job status (without sensitive paths)
+    response = {
+        'job_id': job_id,
+        'status': job['status'],
+        'created_at': job.get('created_at'),
+        'progress': job.get('progress', 'Unknown')
+    }
+    
+    if job['status'] == 'completed':
+        response.update({
+            'silence_removed': job.get('silence_removed', 0),
+            'time_saved_seconds': job.get('time_saved_seconds', 0),
+            'input_size_mb': job.get('input_size_mb', 0),
+            'output_size_mb': job.get('output_size_mb', 0),
+            'completed_at': job.get('completed_at'),
+            'download_url': f'/remove-silence/download/{job_id}'
+        })
+    elif job['status'] == 'no_silence':
+        response.update({
+            'message': job.get('message', 'No silence found'),
+            'completed_at': job.get('completed_at')
+        })
+    elif job['status'] == 'error':
+        response.update({
+            'error': job.get('error', 'Unknown error'),
+            'completed_at': job.get('completed_at')
+        })
+    
+    return jsonify(response), 200
+
+@app.route('/remove-silence/download/<job_id>', methods=['GET'])
+def remove_silence_download(job_id):
+    """Download the processed video"""
+    with jobs_lock:
+        job = processing_jobs.get(job_id)
+    
+    if not job:
+        return jsonify({
+            'status': 'error',
+            'message': 'Job not found'
+        }), 404
+    
+    if job['status'] != 'completed':
+        return jsonify({
+            'status': 'error',
+            'message': f'Job is not completed. Current status: {job["status"]}'
+        }), 400
+    
+    output_path = job.get('output_path')
+    if not output_path or not os.path.exists(output_path):
+        return jsonify({
+            'status': 'error',
+            'message': 'Output file not found. It may have been cleaned up.'
+        }), 404
+    
+    response = send_file(
+        output_path,
+        mimetype='video/mp4',
+        as_attachment=True,
+        download_name='cleaned_video.mp4'
+    )
+    
+    @response.call_on_close
+    def cleanup():
+        # Don't delete immediately - give time for download to complete
+        time.sleep(5)
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+                print(f"🧹 Cleaned up downloaded file for job {job_id}")
+            except:
+                pass
+    
+    return response
 
 @app.route('/remove-silence/info', methods=['POST'])
 def remove_silence_info():
@@ -440,7 +615,9 @@ def test():
         'endpoints': {
             'health': '/health (GET)',
             'fonts': '/fonts (GET)',
-            'remove_silence': '/remove-silence (POST)',
+            'remove_silence_async': '/remove-silence (POST) - Returns job ID',
+            'remove_silence_status': '/remove-silence/status/<job_id> (GET)',
+            'remove_silence_download': '/remove-silence/download/<job_id> (GET)',
             'get_info': '/remove-silence/info (POST)',
             'burn_captions': '/burn-captions (POST)',  
             'create_srt': '/create-srt (POST)' 
