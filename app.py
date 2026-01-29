@@ -277,16 +277,30 @@ def process_burn_captions(job_id, video_url, words, words_per_line, caption_styl
             '-c:a', 'copy',
             output_path, '-y'
         ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
+        # Don't buffer FFmpeg output - stream and keep only last 2KB for errors
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stderr_buffer = []
+        max_stderr_size = 2048
+        for line in process.stderr:
+            stderr_buffer.append(line)
+            while sum(len(l) for l in stderr_buffer) > max_stderr_size:
+                stderr_buffer.pop(0)
+        returncode = process.wait()
+        stderr_output = ''.join(stderr_buffer)
+
         # Clean up input and SRT files
         if os.path.exists(input_path):
             os.remove(input_path)
         if os.path.exists(srt_path):
             os.remove(srt_path)
-        
-        if result.returncode == 0:
+
+        if returncode == 0:
             print("✅ Captions burned successfully!")
             input_size = os.path.getsize(output_path) / (1024 * 1024) if os.path.exists(output_path) else 0
             
@@ -299,12 +313,12 @@ def process_burn_captions(job_id, video_url, words, words_per_line, caption_styl
                         'completed_at': time.time()
                     })
         else:
-            print(f"❌ FFmpeg error: {result.stderr}")
+            print(f"❌ FFmpeg error: {stderr_output}")
             with jobs_lock:
                 if job_id in processing_jobs:
                     processing_jobs[job_id].update({
                         'status': 'error',
-                        'error': f'Failed to burn captions: {result.stderr[:200]}',
+                        'error': f'Failed to burn captions: {stderr_output[:200]}',
                         'completed_at': time.time()
                     })
     except Exception as e:
@@ -320,15 +334,17 @@ def process_burn_captions(job_id, video_url, words, words_per_line, caption_styl
                 })
 
 def cleanup_old_jobs():
-    """Remove jobs older than 1 hour"""
+    """Remove jobs older than 15 minutes and enforce max job limit"""
     current_time = time.time()
+    max_jobs = 50  # Limit total jobs to prevent unbounded memory growth
+
     with jobs_lock:
         to_remove = []
         for job_id, job in processing_jobs.items():
-            # Clean up completed/error jobs older than 1 hour
+            # Clean up completed/error jobs older than 15 minutes (was 1 hour)
             if job.get('status') in ['completed', 'error', 'no_silence']:
                 completed_at = job.get('completed_at', job.get('created_at', 0))
-                if current_time - completed_at > 3600:  # 1 hour
+                if current_time - completed_at > 900:  # 15 minutes
                     # Also delete the output file if it exists
                     output_path = job.get('output_path')
                     if output_path and os.path.exists(output_path):
@@ -338,7 +354,27 @@ def cleanup_old_jobs():
                         except:
                             pass
                     to_remove.append(job_id)
-        
+
+        # If still over limit, remove oldest completed jobs first
+        remaining = len(processing_jobs) - len(to_remove)
+        if remaining > max_jobs:
+            # Sort completed jobs by completion time, oldest first
+            completed_jobs = [
+                (jid, j.get('completed_at', j.get('created_at', 0)))
+                for jid, j in processing_jobs.items()
+                if j.get('status') in ['completed', 'error', 'no_silence'] and jid not in to_remove
+            ]
+            completed_jobs.sort(key=lambda x: x[1])
+            # Remove oldest until under limit
+            for jid, _ in completed_jobs[:remaining - max_jobs]:
+                output_path = processing_jobs[jid].get('output_path')
+                if output_path and os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+                to_remove.append(jid)
+
         for job_id in to_remove:
             del processing_jobs[job_id]
 
@@ -357,26 +393,29 @@ def list_fonts():
     List all available fonts on the system that FFmpeg can use.
     """
     try:
-        # Run fc-list to get font families
-        result = subprocess.run(['fc-list', ':', 'family'], capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            return jsonify({
-                'status': 'error',
-                'message': 'Failed to list fonts',
-                'details': result.stderr
-            }), 500
-            
-        # Parse the output
+        # Run fc-list to get font families - limit output to prevent memory issues
+        process = subprocess.Popen(
+            ['fc-list', ':', 'family'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
         fonts = set()
-        raw_output = result.stdout.strip().split('\n')
-        
-        for line in raw_output:
+        for line in process.stdout:
             if line.strip():
                 families = line.split(',')
                 for family in families:
                     fonts.add(family.strip())
-        
+
+        _, stderr = process.communicate()
+        if process.returncode != 0:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to list fonts',
+                'details': stderr
+            }), 500
+
         sorted_fonts = sorted(list(fonts))
         
         # Check for local fonts in the fonts/ folder
@@ -531,11 +570,11 @@ def remove_silence_download(job_id):
     def generate():
         with open(output_path, 'rb') as f:
             while True:
-                chunk = f.read(8192)  # 8KB chunks
+                chunk = f.read(256 * 1024)  # 256KB chunks (was 8KB)
                 if not chunk:
                     break
                 yield chunk
-    
+
     from flask import Response
     response = Response(
         generate(),
@@ -545,17 +584,16 @@ def remove_silence_download(job_id):
             'Content-Length': str(os.path.getsize(output_path))
         }
     )
-    
+
     @response.call_on_close
     def cleanup():
-        time.sleep(5)
         if os.path.exists(output_path):
             try:
                 os.remove(output_path)
                 print(f"🧹 Cleaned up downloaded file for job {job_id}")
             except:
                 pass
-    
+
     return response
 
 @app.route('/remove-silence/info', methods=['POST'])
@@ -771,11 +809,11 @@ def burn_captions_download(job_id):
     def generate():
         with open(output_path, 'rb') as f:
             while True:
-                chunk = f.read(8192)  # 8KB chunks
+                chunk = f.read(256 * 1024)  # 256KB chunks (was 8KB)
                 if not chunk:
                     break
                 yield chunk
-    
+
     from flask import Response
     response = Response(
         generate(),
@@ -785,17 +823,16 @@ def burn_captions_download(job_id):
             'Content-Length': str(os.path.getsize(output_path))
         }
     )
-    
+
     @response.call_on_close
     def cleanup():
-        time.sleep(5)
         if os.path.exists(output_path):
             try:
                 os.remove(output_path)
                 print(f"🧹 Cleaned up downloaded file for job {job_id}")
             except:
                 pass
-    
+
     return response
 
 @app.route('/create-srt', methods=['POST'])

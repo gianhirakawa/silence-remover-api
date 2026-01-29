@@ -9,30 +9,31 @@ import uuid
 def download_from_url(url, output_path):
     """Download video from URL"""
     print(f"📥 Downloading from URL...")
-    
+
     response = requests.get(url, stream=True, timeout=300)
     response.raise_for_status()
-    
+
     total_size = int(response.headers.get('content-length', 0))
     downloaded = 0
-    
+
+    # Use 1MB chunks for better performance and lower memory fragmentation
     with open(output_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
+        for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
             if chunk:
                 f.write(chunk)
                 downloaded += len(chunk)
                 if total_size > 0:
                     progress = (downloaded / total_size) * 100
                     print(f"\r  Progress: {progress:.1f}%", end='', flush=True)
-    
+
     print(f"\n✅ Downloaded: {downloaded / (1024*1024):.2f}MB")
     return output_path
 
 def detect_silence(input_file, noise_level="-30dB", min_duration=0.5):
-    """Detect silent parts in video"""
+    """Detect silent parts in video - streams output to minimize memory usage"""
     print(f"🔍 Detecting silence...")
     print(f"   Threshold: {noise_level}, Min duration: {min_duration}s")
-    
+
     cmd = [
         'ffmpeg',
         '-i', input_file,
@@ -40,21 +41,39 @@ def detect_silence(input_file, noise_level="-30dB", min_duration=0.5):
         '-f', 'null',
         '-'
     ]
-    
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    output = result.stdout
-    
-    silence_starts = re.findall(r'silence_start: ([\d.]+)', output)
-    silence_ends = re.findall(r'silence_end: ([\d.]+)', output)
-    
+
+    # Stream stderr line by line instead of buffering entire output
+    # This prevents memory issues with long videos
     silences = []
-    for start, end in zip(silence_starts, silence_ends):
-        silences.append({
-            'start': float(start),
-            'end': float(end),
-            'duration': float(end) - float(start)
-        })
-    
+    current_start = None
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1  # Line buffered
+    )
+
+    for line in process.stderr:
+        # Extract silence_start
+        start_match = re.search(r'silence_start: ([\d.]+)', line)
+        if start_match:
+            current_start = float(start_match.group(1))
+
+        # Extract silence_end
+        end_match = re.search(r'silence_end: ([\d.]+)', line)
+        if end_match and current_start is not None:
+            end = float(end_match.group(1))
+            silences.append({
+                'start': current_start,
+                'end': end,
+                'duration': end - current_start
+            })
+            current_start = None
+
+    process.wait()
+
     print(f"✅ Found {len(silences)} silent periods")
     return silences
 
@@ -174,10 +193,26 @@ def remove_silence_from_url(video_url, noise_level="-30dB", min_duration=0.5):
             output_path,
             '-y'
         ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
+
+        # Don't buffer FFmpeg output - discard stdout, capture only last stderr for errors
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        # Read stderr but only keep last 2KB for error reporting
+        stderr_buffer = []
+        max_stderr_size = 2048
+        for line in process.stderr:
+            stderr_buffer.append(line)
+            # Keep only recent lines to limit memory
+            while sum(len(l) for l in stderr_buffer) > max_stderr_size:
+                stderr_buffer.pop(0)
+        returncode = process.wait()
+        stderr_output = ''.join(stderr_buffer)
+
+        if returncode == 0:
             print(f"\n✅ Processing complete!")
             
             input_size = os.path.getsize(input_path) / (1024 * 1024)
@@ -193,8 +228,8 @@ def remove_silence_from_url(video_url, noise_level="-30dB", min_duration=0.5):
                 'output_size_mb': output_size
             }
         else:
-            print(f"❌ FFmpeg error: {result.stderr}")
-            return {'status': 'error', 'message': 'FFmpeg processing failed', 'error': result.stderr}
+            print(f"❌ FFmpeg error: {stderr_output}")
+            return {'status': 'error', 'message': 'FFmpeg processing failed', 'error': stderr_output}
             
     except Exception as e:
         print(f"❌ Error: {e}")
