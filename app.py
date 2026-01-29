@@ -91,6 +91,12 @@ processing_jobs = {}
 # Lock for thread-safe access to processing_jobs
 jobs_lock = threading.Lock()
 
+# Concurrency control - limit simultaneous video processing to prevent OOM
+MAX_CONCURRENT_JOBS = int(os.environ.get('MAX_CONCURRENT_JOBS', 2))
+processing_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
+active_processing_count = 0
+active_processing_lock = threading.Lock()
+
 def validate_video_url(video_url):
     """Validate that video_url is not pointing to our own API endpoints"""
     if not video_url:
@@ -114,23 +120,29 @@ def validate_video_url(video_url):
 
 def process_silence_removal(job_id, video_url, noise_level, min_duration):
     """Background function to process video removal"""
+    global active_processing_count
+
+    # Mark as queued while waiting for semaphore
     with jobs_lock:
-        # Update existing job instead of overwriting
         if job_id in processing_jobs:
             processing_jobs[job_id].update({
-                'status': 'processing',
-                'progress': 'Downloading video...'
+                'status': 'queued',
+                'progress': 'Waiting for available processing slot...'
             })
-        else:
-            processing_jobs[job_id] = {
-                'status': 'processing',
-                'created_at': time.time(),
-                'video_url': video_url,
-                'progress': 'Downloading video...',
-                'job_type': 'remove-silence'
-            }
-    
+
+    # Wait for available processing slot
+    processing_semaphore.acquire()
+    with active_processing_lock:
+        active_processing_count += 1
+
     try:
+        with jobs_lock:
+            if job_id in processing_jobs:
+                processing_jobs[job_id].update({
+                    'status': 'processing',
+                    'progress': 'Downloading video...'
+                })
+
         print(f"📝 [Job {job_id}] Processing request for: {video_url}")
         
         # Update progress
@@ -179,28 +191,38 @@ def process_silence_removal(job_id, video_url, noise_level, min_duration):
                     'error': str(e),
                     'completed_at': time.time()
                 })
+    finally:
+        # Release processing slot
+        with active_processing_lock:
+            active_processing_count -= 1
+        processing_semaphore.release()
 
 def process_burn_captions(job_id, video_url, words, words_per_line, caption_style, all_caps, style_preset, style):
     """Background function to process caption burning"""
+    global active_processing_count
     import json as json_lib
-    
+
+    # Mark as queued while waiting for semaphore
     with jobs_lock:
-        # Update existing job instead of overwriting
         if job_id in processing_jobs:
             processing_jobs[job_id].update({
-                'status': 'processing',
-                'progress': 'Downloading video...'
+                'status': 'queued',
+                'progress': 'Waiting for available processing slot...'
             })
-        else:
-            processing_jobs[job_id] = {
-                'status': 'processing',
-                'created_at': time.time(),
-                'video_url': video_url,
-                'progress': 'Downloading video...',
-                'job_type': 'burn-captions'
-            }
-    
+
+    # Wait for available processing slot
+    processing_semaphore.acquire()
+    with active_processing_lock:
+        active_processing_count += 1
+
     try:
+        with jobs_lock:
+            if job_id in processing_jobs:
+                processing_jobs[job_id].update({
+                    'status': 'processing',
+                    'progress': 'Downloading video...'
+                })
+
         print(f"📝 [Job {job_id}] Processing burn-captions request")
         
         # Sanitize words
@@ -357,6 +379,11 @@ def process_burn_captions(job_id, video_url, words, words_per_line, caption_styl
                     'error': str(e),
                     'completed_at': time.time()
                 })
+    finally:
+        # Release processing slot
+        with active_processing_lock:
+            active_processing_count -= 1
+        processing_semaphore.release()
 
 def cleanup_old_jobs():
     """Remove jobs older than 15 minutes and enforce max job limit"""
@@ -406,10 +433,42 @@ def cleanup_old_jobs():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
+    with active_processing_lock:
+        current_active = active_processing_count
+    with jobs_lock:
+        queued = sum(1 for j in processing_jobs.values() if j.get('status') == 'queued')
     return jsonify({
         'status': 'healthy',
         'service': 'silence-remover-api',
-        'version': '1.0.0'
+        'version': '1.0.0',
+        'processing': {
+            'active': current_active,
+            'queued': queued,
+            'max_concurrent': MAX_CONCURRENT_JOBS
+        }
+    })
+
+@app.route('/queue-status', methods=['GET'])
+def queue_status():
+    """Get current processing queue status"""
+    with active_processing_lock:
+        current_active = active_processing_count
+    with jobs_lock:
+        queued_jobs = [
+            {'job_id': jid, 'job_type': j.get('job_type'), 'created_at': j.get('created_at')}
+            for jid, j in processing_jobs.items() if j.get('status') == 'queued'
+        ]
+        processing_jobs_list = [
+            {'job_id': jid, 'job_type': j.get('job_type'), 'progress': j.get('progress')}
+            for jid, j in processing_jobs.items() if j.get('status') == 'processing'
+        ]
+    return jsonify({
+        'active_processing': current_active,
+        'max_concurrent': MAX_CONCURRENT_JOBS,
+        'slots_available': MAX_CONCURRENT_JOBS - current_active,
+        'queued_count': len(queued_jobs),
+        'queued_jobs': queued_jobs,
+        'processing_jobs': processing_jobs_list
     })
 
 @app.route('/fonts', methods=['GET'])
