@@ -16,6 +16,41 @@ CORS(app)  # Enable CORS for all routes
 # API Key protection
 API_KEY = os.environ.get('API_KEY')
 
+# Supabase Storage configuration
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY')
+SUPABASE_BUCKET = os.environ.get('SUPABASE_BUCKET', 'processed-videos')
+
+def upload_to_supabase(file_path, video_id, job_type):
+    """Upload a file to Supabase Storage and return the public URL"""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise Exception("Supabase credentials not configured")
+
+    # Generate filename: video_id + job_type + timestamp
+    timestamp = int(time.time())
+    filename = f"{video_id}_{job_type}_{timestamp}.mp4"
+
+    # Read file
+    with open(file_path, 'rb') as f:
+        file_data = f.read()
+
+    # Upload to Supabase Storage
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
+    headers = {
+        'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+        'Content-Type': 'video/mp4',
+        'x-upsert': 'true'
+    }
+
+    response = requests.post(upload_url, headers=headers, data=file_data)
+
+    if response.status_code not in [200, 201]:
+        raise Exception(f"Supabase upload failed: {response.status_code} - {response.text}")
+
+    # Return public URL
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{filename}"
+    return public_url, filename
+
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -118,7 +153,7 @@ def validate_video_url(video_url):
     
     return True, None
 
-def process_silence_removal(job_id, video_url, noise_level, min_duration):
+def process_silence_removal(job_id, video_url, noise_level, min_duration, video_id=None, upload_to_storage=False):
     """Background function to process video removal"""
     global active_processing_count
 
@@ -161,7 +196,7 @@ def process_silence_removal(job_id, video_url, noise_level, min_duration):
         with jobs_lock:
             if job_id in processing_jobs:
                 if result['status'] == 'success':
-                    processing_jobs[job_id].update({
+                    job_result = {
                         'status': 'completed',
                         'output_path': result['output_path'],
                         'silence_removed': result.get('silence_removed', 0),
@@ -169,7 +204,31 @@ def process_silence_removal(job_id, video_url, noise_level, min_duration):
                         'input_size_mb': result.get('input_size_mb', 0),
                         'output_size_mb': result.get('output_size_mb', 0),
                         'completed_at': time.time()
-                    })
+                    }
+                    if video_id:
+                        job_result['video_id'] = video_id
+
+                    # Upload to Supabase if requested
+                    if upload_to_storage and video_id:
+                        try:
+                            processing_jobs[job_id]['progress'] = 'Uploading to storage...'
+                            storage_url, filename = upload_to_supabase(
+                                result['output_path'],
+                                video_id,
+                                'silence-removed'
+                            )
+                            job_result['storage_url'] = storage_url
+                            job_result['storage_filename'] = filename
+                            # Clean up local file after upload
+                            if os.path.exists(result['output_path']):
+                                os.remove(result['output_path'])
+                                job_result['output_path'] = None
+                            print(f"✅ [Job {job_id}] Uploaded to Supabase: {storage_url}")
+                        except Exception as e:
+                            print(f"⚠️ [Job {job_id}] Supabase upload failed: {e}")
+                            job_result['storage_error'] = str(e)
+
+                    processing_jobs[job_id].update(job_result)
                 elif result['status'] == 'no_silence':
                     processing_jobs[job_id].update({
                         'status': 'no_silence',
@@ -197,7 +256,7 @@ def process_silence_removal(job_id, video_url, noise_level, min_duration):
             active_processing_count -= 1
         processing_semaphore.release()
 
-def process_burn_captions(job_id, video_url, words, words_per_line, caption_style, all_caps, style_preset, style):
+def process_burn_captions(job_id, video_url, words, words_per_line, caption_style, all_caps, style_preset, style, video_id=None, upload_to_storage=False):
     """Background function to process caption burning"""
     global active_processing_count
     import json as json_lib
@@ -349,16 +408,42 @@ def process_burn_captions(job_id, video_url, words, words_per_line, caption_styl
 
         if returncode == 0:
             print("✅ Captions burned successfully!")
-            input_size = os.path.getsize(output_path) / (1024 * 1024) if os.path.exists(output_path) else 0
-            
+            output_size = os.path.getsize(output_path) / (1024 * 1024) if os.path.exists(output_path) else 0
+
+            job_result = {
+                'status': 'completed',
+                'output_path': output_path,
+                'output_size_mb': output_size,
+                'completed_at': time.time()
+            }
+            if video_id:
+                job_result['video_id'] = video_id
+
+            # Upload to Supabase if requested
+            if upload_to_storage and video_id:
+                try:
+                    with jobs_lock:
+                        if job_id in processing_jobs:
+                            processing_jobs[job_id]['progress'] = 'Uploading to storage...'
+                    storage_url, filename = upload_to_supabase(
+                        output_path,
+                        video_id,
+                        'captioned'
+                    )
+                    job_result['storage_url'] = storage_url
+                    job_result['storage_filename'] = filename
+                    # Clean up local file after upload
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                        job_result['output_path'] = None
+                    print(f"✅ [Job {job_id}] Uploaded to Supabase: {storage_url}")
+                except Exception as e:
+                    print(f"⚠️ [Job {job_id}] Supabase upload failed: {e}")
+                    job_result['storage_error'] = str(e)
+
             with jobs_lock:
                 if job_id in processing_jobs:
-                    processing_jobs[job_id].update({
-                        'status': 'completed',
-                        'output_path': output_path,
-                        'output_size_mb': input_size,
-                        'completed_at': time.time()
-                    })
+                    processing_jobs[job_id].update(job_result)
         else:
             print(f"❌ FFmpeg error: {stderr_output}")
             with jobs_lock:
@@ -535,18 +620,26 @@ def remove_silence_async():
     video_url = data.get('video_url')
     if not video_url:
         return jsonify({'error': 'video_url required'}), 400
-    
+
     # Validate video URL
     is_valid, error_msg = validate_video_url(video_url)
     if not is_valid:
         return jsonify({'error': error_msg}), 400
-    
+
     noise_level = data.get('noise_level', '-30dB')
     min_duration = float(data.get('min_duration', 0.5))
-    
+
+    # New parameters for storage integration
+    video_id = data.get('video_id')
+    upload_to_storage = data.get('upload_to_storage', False)
+
+    # Validate: upload_to_storage requires video_id
+    if upload_to_storage and not video_id:
+        return jsonify({'error': 'video_id is required when upload_to_storage is true'}), 400
+
     # Generate job ID
     job_id = str(uuid.uuid4())
-    
+
     # Initialize job
     with jobs_lock:
         processing_jobs[job_id] = {
@@ -555,13 +648,15 @@ def remove_silence_async():
             'video_url': video_url,
             'noise_level': noise_level,
             'min_duration': min_duration,
-            'job_type': 'remove-silence'
+            'job_type': 'remove-silence',
+            'video_id': video_id,
+            'upload_to_storage': upload_to_storage
         }
-    
+
     # Start background processing
     thread = threading.Thread(
         target=process_silence_removal,
-        args=(job_id, video_url, noise_level, min_duration)
+        args=(job_id, video_url, noise_level, min_duration, video_id, upload_to_storage)
     )
     thread.daemon = True
     thread.start()
@@ -597,16 +692,27 @@ def remove_silence_status(job_id):
         'created_at': job.get('created_at'),
         'progress': job.get('progress', 'Unknown')
     }
-    
+
+    # Include video_id if present
+    if job.get('video_id'):
+        response['video_id'] = job['video_id']
+
     if job['status'] == 'completed':
         response.update({
             'silence_removed': job.get('silence_removed', 0),
             'time_saved_seconds': job.get('time_saved_seconds', 0),
             'input_size_mb': job.get('input_size_mb', 0),
             'output_size_mb': job.get('output_size_mb', 0),
-            'completed_at': job.get('completed_at'),
-            'download_url': f'/remove-silence/download/{job_id}'
+            'completed_at': job.get('completed_at')
         })
+        # Include storage URL if uploaded to Supabase
+        if job.get('storage_url'):
+            response['storage_url'] = job['storage_url']
+            response['storage_filename'] = job.get('storage_filename')
+        else:
+            response['download_url'] = f'/remove-silence/download/{job_id}'
+        if job.get('storage_error'):
+            response['storage_error'] = job['storage_error']
     elif job['status'] == 'no_silence':
         response.update({
             'message': job.get('message', 'No silence found'),
@@ -787,23 +893,33 @@ def burn_captions_async():
             preset = STYLE_PRESETS[style_preset].copy()
             preset.update(style)
             style = preset
-        
+
+        # New parameters for storage integration
+        video_id = data.get('video_id')
+        upload_to_storage = data.get('upload_to_storage', False)
+
+        # Validate: upload_to_storage requires video_id
+        if upload_to_storage and not video_id:
+            return jsonify({'error': 'video_id is required when upload_to_storage is true'}), 400
+
         # Generate job ID
         job_id = str(uuid.uuid4())
-        
+
         # Initialize job
         with jobs_lock:
             processing_jobs[job_id] = {
                 'status': 'pending',
                 'created_at': time.time(),
                 'video_url': video_url,
-                'job_type': 'burn-captions'
+                'job_type': 'burn-captions',
+                'video_id': video_id,
+                'upload_to_storage': upload_to_storage
             }
-        
+
         # Start background processing
         thread = threading.Thread(
             target=process_burn_captions,
-            args=(job_id, video_url, words, words_per_line, caption_style, all_caps, style_preset, style)
+            args=(job_id, video_url, words, words_per_line, caption_style, all_caps, style_preset, style, video_id, upload_to_storage)
         )
         thread.daemon = True
         thread.start()
@@ -848,19 +964,30 @@ def burn_captions_status(job_id):
         'created_at': job.get('created_at'),
         'progress': job.get('progress', 'Unknown')
     }
-    
+
+    # Include video_id if present
+    if job.get('video_id'):
+        response['video_id'] = job['video_id']
+
     if job['status'] == 'completed':
         response.update({
             'output_size_mb': job.get('output_size_mb', 0),
-            'completed_at': job.get('completed_at'),
-            'download_url': f'/burn-captions/download/{job_id}'
+            'completed_at': job.get('completed_at')
         })
+        # Include storage URL if uploaded to Supabase
+        if job.get('storage_url'):
+            response['storage_url'] = job['storage_url']
+            response['storage_filename'] = job.get('storage_filename')
+        else:
+            response['download_url'] = f'/burn-captions/download/{job_id}'
+        if job.get('storage_error'):
+            response['storage_error'] = job['storage_error']
     elif job['status'] == 'error':
         response.update({
             'error': job.get('error', 'Unknown error'),
             'completed_at': job.get('completed_at')
         })
-    
+
     return jsonify(response), 200
 
 @app.route('/burn-captions/download/<job_id>', methods=['GET'])
