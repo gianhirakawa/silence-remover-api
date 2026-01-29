@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from functools import wraps
 import os
 import time
 import uuid
@@ -11,6 +12,28 @@ from create_srt import create_srt_from_words, create_word_by_word_srt
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
+
+# API Key protection
+API_KEY = os.environ.get('API_KEY')
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not API_KEY:
+            # No API key configured, allow all requests
+            return f(*args, **kwargs)
+
+        # Check header first, then query param
+        provided_key = request.headers.get('X-API-Key') or request.args.get('api_key')
+
+        if not provided_key:
+            return jsonify({'error': 'API key required. Provide X-API-Key header or api_key query param.'}), 401
+
+        if provided_key != API_KEY:
+            return jsonify({'error': 'Invalid API key'}), 403
+
+        return f(*args, **kwargs)
+    return decorated
 
 # --- NEW: Local Fonts Configuration ---
 # Define the path to your local fonts folder next to app.py
@@ -446,6 +469,7 @@ def list_fonts():
         }), 500
 
 @app.route('/remove-silence', methods=['POST'])
+@require_api_key
 def remove_silence_async():
     """Async silence removal - returns job ID immediately"""
     data = request.json
@@ -493,6 +517,7 @@ def remove_silence_async():
     }), 202
 
 @app.route('/remove-silence/status/<job_id>', methods=['GET'])
+@require_api_key
 def remove_silence_status(job_id):
     """Check status of a silence removal job"""
     cleanup_old_jobs()
@@ -537,6 +562,7 @@ def remove_silence_status(job_id):
     return jsonify(response), 200
 
 @app.route('/remove-silence/download/<job_id>', methods=['GET'])
+@require_api_key
 def remove_silence_download(job_id):
     """Download the processed video (streaming for large files)"""
     with jobs_lock:
@@ -599,6 +625,7 @@ def remove_silence_download(job_id):
     return response
 
 @app.route('/remove-silence/info', methods=['POST'])
+@require_api_key
 def remove_silence_info():
     """Get silence information without processing"""
     data = request.json
@@ -633,6 +660,7 @@ def remove_silence_info():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/burn-captions', methods=['POST'])
+@require_api_key
 def burn_captions_async():
     """
     Async burn captions - returns job ID immediately
@@ -734,6 +762,7 @@ def burn_captions_async():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/burn-captions/status/<job_id>', methods=['GET'])
+@require_api_key
 def burn_captions_status(job_id):
     """Check status of a burn-captions job"""
     cleanup_old_jobs()
@@ -776,6 +805,7 @@ def burn_captions_status(job_id):
     return jsonify(response), 200
 
 @app.route('/burn-captions/download/<job_id>', methods=['GET'])
+@require_api_key
 def burn_captions_download(job_id):
     """Download the processed video with captions"""
     with jobs_lock:
@@ -838,6 +868,7 @@ def burn_captions_download(job_id):
     return response
 
 @app.route('/create-srt', methods=['POST'])
+@require_api_key
 def create_srt_only():
     """
     Just create SRT file from words (no video processing)
