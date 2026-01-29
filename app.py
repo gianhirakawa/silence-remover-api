@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 import os
 import time
 import uuid
@@ -9,6 +10,7 @@ from remove_silence import remove_silence_from_url, download_from_url
 from create_srt import create_srt_from_words, create_word_by_word_srt
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # --- NEW: Local Fonts Configuration ---
 # Define the path to your local fonts folder next to app.py
